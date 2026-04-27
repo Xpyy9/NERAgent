@@ -38,3 +38,4 @@ NERAgent
 *.md
 .DS_Store
 
+.worktrees/

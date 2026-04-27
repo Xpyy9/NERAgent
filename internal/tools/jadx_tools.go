@@ -1,14 +1,13 @@
 package tools
 
 import (
+	"NERAgent/internal/config"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,16 +29,17 @@ func GetCachedOverview() string {
 	return ""
 }
 
-func NewJadxClient() (*JadxClient, error) {
-	baseu := os.Getenv("JADX_BASE_URL")
-	if baseu == "" {
-		baseu = "http://localhost:13997"
+func NewJadxClient(cfg *config.JADXConfig) (*JadxClient, error) {
+	baseURL := cfg.BaseURL
+	if baseURL == "" {
+		baseURL = "http://localhost:13997"
 	}
 	return &JadxClient{
-		BaseURL: baseu,
+		BaseURL: baseURL,
 		HTTPClient: &http.Client{
-			Timeout: 90 * time.Second,
+			Timeout: cfg.HTTPTimeout,
 		},
+		resultCache: NewLRUCache(cfg.CacheSize, cfg.CacheTTL),
 	}, nil
 }
 
@@ -68,9 +68,6 @@ func (p paramBuilder) num(key string, val int) paramBuilder {
 	return p
 }
 
-// 缓存配置
-const cacheTTL = 10 * time.Minute
-
 // mutatingActions 非幂等操作，不缓存且触发缓存清理
 var mutatingActions = map[string]bool{
 	"renameClass":    true,
@@ -87,6 +84,8 @@ var actionMaxLen = map[string]int{
 	"getClassWithStructure": 20000,
 	"batchGetClassCode":     20000,
 	"getMethodWithCallers":  20000,
+	"getMethodCode":         20000,
+	"analyzeComponent":      20000,
 	"getAllClasses":          20000,
 	"getMainAppClasses":     20000,
 	"getXrefs":              20000,
@@ -120,13 +119,9 @@ func cacheKey(path string, params map[string]string) string {
 	return sb.String()
 }
 
-// invalidateResultCache 清空所有结果缓存
+// invalidateResultCache clears all result cache entries.
 func (jc *JadxClient) invalidateResultCache() {
-	jc.resultCache.Range(func(key, _ any) bool {
-		jc.resultCache.Delete(key)
-		return true
-	})
-	log.Printf("[+] Result cache invalidated")
+	jc.resultCache.Invalidate()
 }
 
 // Jadx统一请求函数（含缓存）
@@ -145,13 +140,8 @@ func (jc *JadxClient) callJadxAPI(ctx context.Context, path string, params map[s
 	// 幂等查询：检查缓存
 	if !mutatingActions[action] {
 		ck := cacheKey(path, params)
-		if cached, ok := jc.resultCache.Load(ck); ok {
-			entry := cached.(cachedEntry)
-			if time.Since(entry.timestamp) < cacheTTL {
-				log.Printf("[+] Cache hit: %s?action=%s", path, action)
-				return entry.result, nil
-			}
-			jc.resultCache.Delete(ck)
+		if cached, ok := jc.resultCache.Get(ck); ok {
+			return cached, nil
 		}
 	}
 
@@ -180,7 +170,7 @@ func (jc *JadxClient) callJadxAPI(ctx context.Context, path string, params map[s
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
-			log.Printf("[-]Jadx请求失败Error Closing Response Body: %v", err)
+			// 忽略关闭错误
 		}
 	}()
 
@@ -202,7 +192,7 @@ func (jc *JadxClient) callJadxAPI(ctx context.Context, path string, params map[s
 		truncated := truncateResultByAction(result, action)
 		// 缓存异步结果
 		if !mutatingActions[action] {
-			jc.resultCache.Store(cacheKey(path, params), cachedEntry{result: truncated, timestamp: time.Now()})
+			jc.resultCache.Set(cacheKey(path, params), truncated)
 		}
 		return truncated, nil
 	}
@@ -211,7 +201,7 @@ func (jc *JadxClient) callJadxAPI(ctx context.Context, path string, params map[s
 
 	// 缓存成功结果
 	if !mutatingActions[action] {
-		jc.resultCache.Store(cacheKey(path, params), cachedEntry{result: truncated, timestamp: time.Now()})
+		jc.resultCache.Set(cacheKey(path, params), truncated)
 	}
 
 	return truncated, nil
@@ -236,11 +226,8 @@ func (jc *JadxClient) waitForAsyncResult(ctx context.Context, rawResp []byte) (s
 	}
 	if err := json.Unmarshal(rawResp, &taskResp); err != nil || taskResp.TaskID == "" {
 		// 无法解析 task_id，回退返回原始内容
-		log.Printf("[!] 202 response but no task_id, fallback to raw response")
 		return string(rawResp), nil
 	}
-
-	log.Printf("[+] Async task submitted: %s, starting auto-poll", taskResp.TaskID)
 
 	const pollInterval = 5 * time.Second
 	const maxPolls = 18 // ~90s 超时，与 HTTP client timeout 对齐
@@ -254,7 +241,6 @@ func (jc *JadxClient) waitForAsyncResult(ctx context.Context, rawResp []byte) (s
 
 		result, err := jc.pollTaskStatus(ctx, taskResp.TaskID)
 		if err != nil {
-			log.Printf("[-] Poll taskStatus failed (attempt %d): %v", i+1, err)
 			continue
 		}
 
@@ -263,21 +249,16 @@ func (jc *JadxClient) waitForAsyncResult(ctx context.Context, rawResp []byte) (s
 			Error  string `json:"error"`
 		}
 		if err := json.Unmarshal([]byte(result), &status); err != nil {
-			log.Printf("[-] Failed to parse taskStatus response: %v", err)
 			continue
 		}
 
 		switch status.Status {
 		case "SUCCESS":
-			log.Printf("[+] Async task %s completed after %d polls", taskResp.TaskID, i+1)
 			return result, nil
 		case "FAILED":
 			return "", fmt.Errorf("async task %s failed: %s", taskResp.TaskID, status.Error)
 		default:
 			// RUNNING → continue polling
-			if (i+1)%5 == 0 {
-				log.Printf("[*] Async task %s still running, poll %d/%d", taskResp.TaskID, i+1, maxPolls)
-			}
 		}
 	}
 	return "", fmt.Errorf("async task %s timed out after %d polls (~%d min)", taskResp.TaskID, maxPolls, maxPolls*int(pollInterval.Seconds())/60)
@@ -333,6 +314,7 @@ func (jc *JadxClient) ResourceExplorerSkill(ctx context.Context, input *Resource
 	params := newParams(input.Action).
 		str("keyword", input.Keyword).
 		str("file_name", input.FileName).
+		str("component_name", input.ComponentName).
 		num("context_lines", input.ContextLines).
 		num("startLine", input.StartLine).
 		num("endLine", input.EndLine).
@@ -412,7 +394,6 @@ func (jc *JadxClient) getApkOverviewCached(ctx context.Context) (string, error) 
 	jc.overviewCache = result
 	jc.overviewDone = true
 	globalOverview.Store(result) // 供 APK 分类使用
-	log.Printf("[+] APK overview cached (%d bytes)", len(result))
 	return result, nil
 }
 
@@ -444,11 +425,12 @@ func (jc *JadxClient) BuildJadxTools() ([]tool.BaseTool, error) {
 		"代码洞察工具。逆向分析核心能力，支持以下操作：\n"+
 			"- getAllClasses: 搜索类名列表\n"+
 			"- getClassCode: 获取反编译源码（支持精确方法签名/类名.方法名/完整类名）\n"+
-			"- getClassStructure: 类结构摘要（字段、方法签名、继承关系）\n"+
+			"- getClassStructure: 类结构摘要（字段含类型和access修饰符、方法含签名和access修饰符、继承关系）\n"+
 			"- getClassSmali: Smali 字节码\n"+
 			"- getClassWithStructure: **推荐** 一次返回类结构+完整源码，减少调用次数\n"+
 			"- batchGetClassCode: 批量获取最多5个类的源码（code_names逗号分隔）\n"+
-			"- getMethodWithCallers: 获取方法源码+调用者列表，一次完成代码+xrefs查询\n"+
+			"- getMethodWithCallers: 获取方法源码+调用者列表（结构化对象含class_name/method_name/method_signature）\n"+
+			"- getMethodCode: **新** 获取单个方法反编译代码，无需拉取整个类（需class_name+method_name）\n"+
 			"建议优先使用 getClassWithStructure 替代分别调用 getClassStructure + getClassCode。",
 		jc.CodeInsightSkill,
 	)
@@ -458,12 +440,13 @@ func (jc *JadxClient) BuildJadxTools() ([]tool.BaseTool, error) {
 	t2, err := utils.InferTool(
 		"resource_explorer",
 		"资源探测器。用于获取 Manifest 安全信息、资源文件检索、主入口 Activity 等。\n"+
-			"- getManifestDetail: **推荐** Manifest 结构化解析，一次返回所有组件(含exported/intent-filter/meta-data)、权限、application安全属性(debuggable/allowBackup等)，替代多次 getResourceFile 读取 Manifest\n"+
-			"- searchResourceContent: 资源文件关键词搜索，在指定文件内检索匹配行+上下文，适用于大型 XML/配置文件的定向检索\n"+
+			"- getManifestDetail: **推荐** Manifest 结构化解析，一次返回所有组件(含exported/intent-filter/meta-data)、权限、application安全属性(debuggable/allowBackup等)、security_findings（自动检测安全问题）、deep_links（聚合所有深度链接）\n"+
+			"- analyzeComponent: **新** 组件一站式分析，传入component_name一次返回Manifest元数据+类结构+反编译代码，替代3次独立调用\n"+
+			"- searchResourceContent: 资源文件关键词搜索，在指定文件内检索匹配行+上下文\n"+
 			"- getMainActivity: 主入口 Activity（返回类名+源码）\n"+
 			"- getMainAppClasses: 主包下类列表\n"+
 			"- getAllResourceNames: 搜索资源文件名\n"+
-			"- getResourceFile: 按行范围读取资源文件原文，单次≤250行，大文件优先用 searchResourceContent",
+			"- getResourceFile: 按行范围读取资源文件原文",
 		jc.ResourceExplorerSkill,
 	)
 	if err != nil {
@@ -471,13 +454,12 @@ func (jc *JadxClient) BuildJadxTools() ([]tool.BaseTool, error) {
 	}
 	t3, err := utils.InferTool(
 		"search_engine",
-		"全局搜索引擎。后端自动等待所有搜索结果，调用方无需额外操作。\n"+
-			"- searchMethod：函数名搜索，遍历所有类的方法签名\n"+
+		"全局搜索引擎。后端自动等待所有搜索结果。搜索已优化：CodeIndex就绪时同步返回（毫秒级），未就绪时自动异步构建。\n"+
+			"- searchMethod：函数名搜索，返回结构化结果（class_name/method_name/method_signature/access_flags）\n"+
 			"- searchClass：类搜索。search_in=class_name（默认，快速类名匹配）；search_in=code（代码内容深度检索）\n"+
 			"- searchString：全局字符串搜索\n"+
-			"- scanCrypto：加密特征扫描(Cipher/SecretKeySpec/MessageDigest/getEncoded)\n"+
-			"- smartSearch：**推荐** 智能搜索，先快速类名匹配，无结果自动 fallback 到字符串搜索，减少调用次数\n"+
-			"首次搜索/扫描会触发代码索引构建（一次性开销），后续搜索毫秒级响应。search_in=code 搜索范围大，优先用 smartSearch 或 class_name 搜索。",
+			"- scanCrypto：安全扫描（5大类：weak_crypto/hardcoded_secrets/ssl_tls/webview/data_leakage），返回含severity/category的结构化结果\n"+
+			"- smartSearch：**推荐** 智能搜索，先快速类名匹配，无结果自动 fallback 到字符串搜索",
 		jc.SearchEngineSkill,
 	)
 	if err != nil {
@@ -516,14 +498,9 @@ func (jc *JadxClient) BuildJadxTools() ([]tool.BaseTool, error) {
 		time.Sleep(5 * time.Second)
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
-		_, err := jc.callJadxAPI(ctx, "/searchEngine", map[string]string{
+		_, _ = jc.callJadxAPI(ctx, "/searchEngine", map[string]string{
 			"action": "searchString", "query": "MainActivity", "limit": "1",
 		})
-		if err != nil {
-			log.Printf("[!] Search index prewarm failed: %v", err)
-		} else {
-			log.Printf("[+] Search index prewarm triggered")
-		}
 	}()
 
 	return []tool.BaseTool{t1, t2, t3, t4, t5, t6}, nil

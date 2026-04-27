@@ -16,7 +16,8 @@ const strategyGeneral = `## 通用分析路径
 | 场景 | 切入工具链 | 核心思路 |
 |------|-----------|---------|
 | 功能定位 | getMainActivity → getClassWithStructure → getMethodWithCallers | 从主入口获取结构+源码，一次追踪方法调用者 |
-| 安全审计 | getManifestDetail → smartSearch(敏感API) → getClassWithStructure | Manifest结构化解析(exported/权限/安全属性) → 智能搜索敏感API → 结构+源码一次获取 |
+| 组件审计 | getManifestDetail → analyzeComponent(exported组件) → get_call_chain | Manifest一次获取security_findings → 可疑组件一站式分析(Manifest+结构+代码) → 调用链追踪 |
+| 安全审计 | getManifestDetail(含security_findings+deep_links) → scanCrypto(5类安全扫描) → analyzeComponent(exported组件一站式分析) | Manifest自动检测安全问题+DeepLink汇总 → 全量安全扫描 → exported组件深度分析 |
 | 协议分析 | smartSearch(OkHttp/Retrofit) → getClassWithStructure(Interceptor) → getMethodWithCallers | 智能搜索定位 → 拦截器结构+源码 → 调用链追踪 |
 | SDK分析 | getAllClasses(SDK包名前缀) → batchGetClassCode(核心类) → 分析初始化和回调 | 批量获取核心类源码，减少往返 |
 | 混淆代码 | smartSearch(特征字符串) → getMethodWithCallers → refactor_code(rename) | 智能搜索定位 → 方法源码+调用者 → 重命名 |
@@ -27,8 +28,8 @@ const strategySecurity = `## 安全分析策略
 | 分析类型 | 搜索关键字 | 检查要点 |
 |---------|-----------|---------|
 | 硬编码敏感信息 | searchString: password, secret, api_key, Bearer, -----BEGIN, jdbc: | static final String 密钥材料、SharedPreferences 明文凭证、BuildConfig 敏感值 |
-| 签名算法 | scanCrypto + searchMethod: sign, signature, hmac, digest | 参数拼接 → 密钥获取 → 哈希/HMAC 计算 → 签名附加的完整流程 |
-| 加密实现 | scanCrypto + searchMethod: encrypt, decrypt, cipher, AES, RSA | ECB模式、硬编码IV/密钥、弱密钥(DES/<128bit AES)、java.util.Random 代替 SecureRandom |
+| 签名算法 | scanCrypto(weak_crypto类) + searchMethod: sign, signature, hmac, digest | 参数拼接 → 密钥获取 → 哈希/HMAC 计算 → 签名附加的完整流程 |
+| 加密实现 | scanCrypto(含5类扫描结果:weak_crypto/hardcoded_secrets/ssl_tls/webview/data_leakage) + searchMethod: encrypt, decrypt, cipher, AES, RSA | ECB模式、硬编码IV/密钥、弱密钥(DES/<128bit AES)、java.util.Random 代替 SecureRandom |
 | Launch Anywhere | getManifestDetail → exported Activity 的 intent-filter | getParcelableExtra 获取 Intent 后直接 startActivity，无校验 |
 | WebView 风险 | searchClass: WebView, WebViewClient | setJavaScriptEnabled+addJavascriptInterface、loadUrl 参数外部可控、文件协议攻击面 |
 | 组件安全 | getManifestDetail → exported 组件 + 无 permission 保护 | Activity/Service/Receiver/Provider 各自的数据信任和权限校验 |
@@ -52,11 +53,11 @@ const strategyVuln = `## 扩展漏洞策略
 
 | 漏洞类型 | 搜索关键字 | 判定条件 |
 |---------|-----------|---------|
-| DeepLink 滥用 | getManifestDetail → intent_filters 中的 data scheme | URI 参数直接拼入 loadUrl/startActivity/SQL 查询 |
+| DeepLink 滥用 | getManifestDetail → deep_links 数组直接获取所有 scheme/host/path | URI 参数直接拼入 loadUrl/startActivity/SQL 查询 |
 | Fragment 注入 | searchString: PreferenceActivity | 未重写 isValidFragment() 或始终返回 true |
 | PendingIntent 误用 | searchClass: PendingIntent | 空 Intent 基础 + 无 FLAG_IMMUTABLE + 隐式 Intent |
 | Tapjacking | searchString: filterTouchesWhenObscured | 敏感页面(支付/授权)未设置触摸过滤 |
-| allowBackup 泄露 | getManifestDetail → application.allowBackup | true 或缺省(API<31 默认 true)，未配置 fullBackupContent 排除 |
+| allowBackup 泄露 | getManifestDetail → security_findings 自动检测 allowBackup 问题 | true 或缺省(API<31 默认 true)，未配置 fullBackupContent 排除 |
 | 日志泄露 | searchString: Log.d, Log.v, System.out.println | release 代码中残留调试日志打印敏感信息 |
 | 剪贴板泄露 | searchClass: ClipboardManager, ClipData | 敏感数据(密码/token)写入剪贴板 |
 | SQL 注入 | searchMethod: rawQuery, execSQL | 字符串拼接而非参数化查询(?占位符)，尤其 exported Provider |

@@ -6,12 +6,7 @@ import (
 	"time"
 )
 
-// cachedEntry 缓存条目
-type cachedEntry struct {
-	result    string
-	timestamp time.Time
-}
-
+// JadxClient is the HTTP client for the JADX REST API.
 type JadxClient struct {
 	BaseURL    string `json:"jadxUrl"`
 	HTTPClient *http.Client
@@ -20,29 +15,36 @@ type JadxClient struct {
 	overviewCache string
 	overviewDone  bool
 
-	resultCache sync.Map // key: string (cacheKey), value: cachedEntry
+	resultCache *LRUCache // bounded LRU replacing sync.Map
+}
+
+// cachedEntry is kept for backward compat during migration (used by overview cache).
+type cachedEntry struct {
+	result    string
+	timestamp time.Time
 }
 
 type CodeInsightInput struct {
-	Action    string `json:"action" jsonschema:"description=操作：getAllClasses(类名列表) / getClassCode(源码) / getClassWithStructure(推荐,结构+源码一次返回) / batchGetClassCode(批量获取多个类源码) / getMethodWithCallers(方法源码+调用者)"`
-	Keyword   string `json:"keyword,omitempty" jsonschema:"description=模糊过滤关键字，仅 getAllClasses 生效"`
-	CodeName  string `json:"code_name,omitempty" jsonschema:"description=目标类名或函数名，仅 getClassCode/getClassWithStructure 必填。支持：精确方法签名 / 类名.方法名 / 完整类名"`
-	CodeNames string `json:"code_names,omitempty" jsonschema:"description=逗号分隔的类名列表(最多5个)，仅 batchGetClassCode 必填"`
-	ClassName string `json:"class_name,omitempty" jsonschema:"description=全限定类名，getClassWithStructure/getMethodWithCallers 使用"`
-	MethodName string `json:"method_name,omitempty" jsonschema:"description=方法短名，仅 getMethodWithCallers 必填"`
-	Offset    int    `json:"offset,omitempty" jsonschema:"description=分页偏移量，默认0"`
-	Limit     int    `json:"limit,omitempty" jsonschema:"description=单页数量，默认50，最大500"`
+	Action     string `json:"action" jsonschema:"description=操作：getAllClasses(类名列表) / getClassCode(源码) / getClassWithStructure(推荐,结构+源码一次返回) / batchGetClassCode(批量获取多个类源码) / getMethodWithCallers(方法源码+调用者) / getMethodCode(单方法反编译代码)"`
+	Keyword    string `json:"keyword,omitempty" jsonschema:"description=模糊过滤关键字，仅 getAllClasses 生效"`
+	CodeName   string `json:"code_name,omitempty" jsonschema:"description=目标类名或函数名，仅 getClassCode/getClassWithStructure 必填。支持：精确方法签名 / 类名.方法名 / 完整类名"`
+	CodeNames  string `json:"code_names,omitempty" jsonschema:"description=逗号分隔的类名列表(最多5个)，仅 batchGetClassCode 必填"`
+	ClassName  string `json:"class_name,omitempty" jsonschema:"description=全限定类名，getClassWithStructure/getMethodWithCallers/getMethodCode 使用"`
+	MethodName string `json:"method_name,omitempty" jsonschema:"description=方法短名，getMethodWithCallers/getMethodCode 必填"`
+	Offset     int    `json:"offset,omitempty" jsonschema:"description=分页偏移量，默认0"`
+	Limit      int    `json:"limit,omitempty" jsonschema:"description=单页数量，默认50，最大500"`
 }
 
 type ResourceExplorerInput struct {
-	Action       string `json:"action" jsonschema:"description=操作：getManifestDetail(推荐,Manifest结构化解析) / searchResourceContent(资源文件关键词搜索) / getMainActivity(主入口) / getMainAppClasses(主包类列表) / getAllResourceNames(资源文件名) / getResourceFile(按行读取资源内容)"`
-	Keyword      string `json:"keyword,omitempty" jsonschema:"description=关键字。getAllResourceNames 时模糊过滤文件名；searchResourceContent 时为搜索内容"`
-	FileName     string `json:"file_name,omitempty" jsonschema:"description=资源文件名，getResourceFile/searchResourceContent 必填"`
-	ContextLines int    `json:"context_lines,omitempty" jsonschema:"description=搜索上下文行数(默认3,最大10)，仅 searchResourceContent 可选"`
-	StartLine    int    `json:"startLine,omitempty" jsonschema:"description=起始行号，仅 getResourceFile 可选，单次不超过250行"`
-	EndLine      int    `json:"endLine,omitempty" jsonschema:"description=结束行号，配合 startLine 使用"`
-	Offset       int    `json:"offset,omitempty" jsonschema:"description=分页偏移量，默认0"`
-	Limit        int    `json:"limit,omitempty" jsonschema:"description=单页数量，默认50(getMainAppClasses默认100)，最大500"`
+	Action        string `json:"action" jsonschema:"description=操作：getManifestDetail(推荐,Manifest结构化解析含security_findings和deep_links) / analyzeComponent(组件一站式分析:Manifest+结构+代码一次返回) / searchResourceContent(资源文件关键词搜索) / getMainActivity(主入口) / getMainAppClasses(主包类列表) / getAllResourceNames(资源文件名) / getResourceFile(按行读取资源内容)"`
+	Keyword       string `json:"keyword,omitempty" jsonschema:"description=关键字。getAllResourceNames 时模糊过滤文件名；searchResourceContent 时为搜索内容"`
+	FileName      string `json:"file_name,omitempty" jsonschema:"description=资源文件名，getResourceFile/searchResourceContent 必填"`
+	ComponentName string `json:"component_name,omitempty" jsonschema:"description=组件全限定类名，仅 analyzeComponent 必填"`
+	ContextLines  int    `json:"context_lines,omitempty" jsonschema:"description=搜索上下文行数(默认3,最大10)，仅 searchResourceContent 可选"`
+	StartLine     int    `json:"startLine,omitempty" jsonschema:"description=起始行号，仅 getResourceFile 可选"`
+	EndLine       int    `json:"endLine,omitempty" jsonschema:"description=结束行号，配合 startLine 使用"`
+	Offset        int    `json:"offset,omitempty" jsonschema:"description=分页偏移量，默认0"`
+	Limit         int    `json:"limit,omitempty" jsonschema:"description=单页数量，默认50(getMainAppClasses默认100)，最大500"`
 }
 
 type SearchEngineInput struct {

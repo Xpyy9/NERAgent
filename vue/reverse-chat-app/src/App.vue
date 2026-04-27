@@ -82,17 +82,20 @@
                 <span class="dot" :class="{ pulse: loading }"></span>
                 <span>{{ loading ? 'RUNNING' : 'READY' }}</span>
               </div>
-              <div class="pill" v-if="tokenStats.totalTokens > 0 || loading">
-                <span class="pill-k">TKN</span>
-                <span class="pill-v">{{ fmtTk(tokenStats.totalTokens) }}</span>
-                <template v-if="tokenStats.reasoningTokens > 0">
+              <div class="pill" v-if="totalDisplay.totalTokens > 0 || totalDisplay.promptTokens > 0">
+                <span class="pill-k">IN</span>
+                <span class="pill-v">{{ fmtTk(totalDisplay.promptTokens) }}</span>
+                <span class="pill-d">|</span>
+                <span class="pill-k">OUT</span>
+                <span class="pill-v">{{ fmtTk(totalDisplay.completionTokens) }}</span>
+                <template v-if="totalDisplay.reasoningTokens > 0">
                   <span class="pill-d">|</span>
                   <span class="pill-k">RSN</span>
-                  <span class="pill-v">{{ fmtTk(tokenStats.reasoningTokens) }}</span>
+                  <span class="pill-v">{{ fmtTk(totalDisplay.reasoningTokens) }}</span>
                 </template>
                 <span class="pill-d">|</span>
                 <span class="pill-k">TIME</span>
-                <span class="pill-v">{{ fmtMs(tokenStats.elapsedMs) }}</span>
+                <span class="pill-v">{{ fmtMs(totalDisplay.elapsedMs) }}</span>
               </div>
             </div>
           </div>
@@ -109,7 +112,7 @@
                 <span class="nd-label">{{ stg.label }}</span>
                 <span class="nd-model" v-if="stg.model">{{ stg.model }}</span>
                 <span class="nd-time" v-if="stg.status === 'done' && stg.latencyMs">{{ fmtMs(stg.latencyMs) }}</span>
-                <span class="nd-tokens" v-if="stg.status === 'done' && stg.totalTokens">{{ fmtTk(stg.totalTokens) }}tok</span>
+                <span class="nd-tokens" v-if="stg.status !== 'idle' && (stg.promptTokens || stg.completionTokens)">↑{{ fmtTk(stg.promptTokens) }} ↓{{ fmtTk(stg.completionTokens) }}</span>
               </div>
               <div v-if="i < 2" class="pipe-line" :class="{ filled: stg.status === 'done' }"></div>
             </template>
@@ -359,6 +362,7 @@ localStorage.setItem('session_id', sessionId.value);
 
 const currentStage = ref<StageInfo>({ name: '', model: '', status: 'idle', latencyMs: 0 });
 const stageHistory = ref<StageInfo[]>([]);
+
 const lastPing = ref('--');
 const jadxMemory = ref('--');
 let memTimer: ReturnType<typeof setInterval> | null = null;
@@ -391,6 +395,8 @@ const loadingSec = ref(0);        // seconds since last event while loading
 let stallTimer: ReturnType<typeof setInterval> | null = null;
 
 const tokenStats = ref({ promptTokens: 0, completionTokens: 0, totalTokens: 0, reasoningTokens: 0, elapsedMs: 0 });
+// Stable total for top bar — only updates at stage boundaries, not real-time
+const totalDisplay = ref({ promptTokens: 0, completionTokens: 0, totalTokens: 0, reasoningTokens: 0, elapsedMs: 0 });
 
 watch(messages, v => save(SK.msg, v), { deep: true });
 watch(extractedFiles, v => save(SK.files, v), { deep: true });
@@ -408,6 +414,8 @@ const pipelineStages = computed(() => {
       model: isCurrent ? currentStage.value.model : (hist?.model || ''),
       status: isCurrent ? 'running' : (hist ? 'done' : 'idle') as 'idle' | 'running' | 'done',
       latencyMs: hist?.latencyMs || 0,
+      promptTokens: hist?.promptTokens || 0,
+      completionTokens: hist?.completionTokens || 0,
       totalTokens: hist?.totalTokens || 0,
     };
   });
@@ -451,7 +459,7 @@ onMounted(() => {
   scrollBottom(true);
   fetchMem();
   fetchModels();
-  memTimer = setInterval(fetchMem, 5000);
+  memTimer = setInterval(fetchMem, 600000);
 });
 onUnmounted(() => { if (memTimer) clearInterval(memTimer); stopStallTimer(); });
 
@@ -511,6 +519,7 @@ function newSession() {
   stageHistory.value = [];
   currentStage.value = { name: '', model: '', status: 'idle', latencyMs: 0 };
   tokenStats.value = { promptTokens: 0, completionTokens: 0, totalTokens: 0, reasoningTokens: 0, elapsedMs: 0 };
+  totalDisplay.value = { promptTokens: 0, completionTokens: 0, totalTokens: 0, reasoningTokens: 0, elapsedMs: 0 };
   lastPing.value = '--';
   loading.value = false;
   inputText.value = '';
@@ -552,8 +561,10 @@ async function sendQuery() {
   inputText.value = '';
   loading.value = true;
   tokenStats.value = { promptTokens: 0, completionTokens: 0, totalTokens: 0, reasoningTokens: 0, elapsedMs: 0 };
+  totalDisplay.value = { promptTokens: 0, completionTokens: 0, totalTokens: 0, reasoningTokens: 0, elapsedMs: 0 };
   currentStage.value = { name: '', model: '', status: 'idle', latencyMs: 0 };
   stageHistory.value = [];
+
   startStallTimer();
   userScrolledUp.value = false;
   scrollBottom(true);
@@ -591,7 +602,10 @@ async function sendQuery() {
 
         if (evt === 'usage') {
           touchEvent();
-          try { const u = JSON.parse(d); tokenStats.value = { promptTokens: u.prompt_tokens||0, completionTokens: u.completion_tokens||0, totalTokens: u.total_tokens||0, reasoningTokens: u.reasoning_tokens||0, elapsedMs: u.elapsed_ms||0 }; } catch {}
+          try {
+            const u = JSON.parse(d);
+            tokenStats.value = { promptTokens: u.prompt_tokens||0, completionTokens: u.completion_tokens||0, totalTokens: u.total_tokens||0, reasoningTokens: u.reasoning_tokens||0, elapsedMs: u.elapsed_ms||0 };
+          } catch {}
           evt = 'message'; continue;
         }
 
@@ -601,14 +615,26 @@ async function sendQuery() {
             const s = JSON.parse(d);
             currentStage.value = { name: s.name, model: s.model, status: s.status, latencyMs: s.latency_ms||0 };
             if (s.status === 'done') {
+              // 用后端的 per-stage delta，跨轮次累加到该阶段
+              const existing = stageHistory.value.find(h => h.name === s.name);
               const entry: StageInfo = {
                 name: s.name, model: s.model, status: 'done', latencyMs: s.latency_ms||0,
-                promptTokens: s.prompt_tokens||0, completionTokens: s.completion_tokens||0,
-                totalTokens: s.total_tokens||0, reasoningTokens: s.reasoning_tokens||0,
+                promptTokens: (existing?.promptTokens || 0) + (s.prompt_tokens || 0),
+                completionTokens: (existing?.completionTokens || 0) + (s.completion_tokens || 0),
+                totalTokens: (existing?.totalTokens || 0) + (s.total_tokens || 0),
+                reasoningTokens: (existing?.reasoningTokens || 0) + (s.reasoning_tokens || 0),
               };
               const idx = stageHistory.value.findIndex(h => h.name === s.name);
               if (idx >= 0) stageHistory.value[idx] = entry; else stageHistory.value.push(entry);
               if (s.latency_ms > 0) lastPing.value = fmtMs(s.latency_ms);
+              // 右上角：三个阶段之和
+              totalDisplay.value = {
+                promptTokens: stageHistory.value.reduce((sum, h) => sum + (h.promptTokens || 0), 0),
+                completionTokens: stageHistory.value.reduce((sum, h) => sum + (h.completionTokens || 0), 0),
+                totalTokens: stageHistory.value.reduce((sum, h) => sum + (h.totalTokens || 0), 0),
+                reasoningTokens: stageHistory.value.reduce((sum, h) => sum + (h.reasoningTokens || 0), 0),
+                elapsedMs: tokenStats.value.elapsedMs,
+              };
             }
           } catch {}
           evt = 'message'; continue;
@@ -641,8 +667,7 @@ async function sendQuery() {
           try {
             const r = JSON.parse(d);
             messages.value.push({ role: 'assistant', type: 'round_transition', text: r.message, parsedData: { response: r.summary }, time: now(), collapsed: false });
-            // 重置 pipeline 显示
-            stageHistory.value = [];
+            // 重置当前阶段，但保留 stageHistory 以保持累计 token 展示
             currentStage.value = { name: '', model: '', status: 'idle', latencyMs: 0 };
             scrollBottom();
           } catch {}
@@ -691,6 +716,7 @@ async function sendQuery() {
       }
     }
     loading.value = false;
+    totalDisplay.value = { ...tokenStats.value };
     stopStallTimer();
     scrollBottom();
   }
@@ -884,6 +910,8 @@ async function sendQuery() {
 .pill-k { color: var(--tx3); letter-spacing: 0.1em; }
 .pill-v { color: var(--accent); }
 .pill-d { color: rgba(255,255,255,0.08); }
+.pill-stage { font-size: 9px; padding: 2px 8px; gap: 4px; }
+.pill-model { color: var(--tx2); opacity: 0.7; font-size: 9px; }
 
 /* ═══════════════════════════════════════
    7. Pipeline
